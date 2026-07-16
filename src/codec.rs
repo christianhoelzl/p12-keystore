@@ -60,7 +60,35 @@ pub struct ParsedAuthSafe {
     pub secrets: Vec<ParsedSecret>,
 }
 
+const MAX_MAC_ITERATIONS: i32 = 1_000_000;
+
+// Upper bound for KDF iteration counts read from container DER.
+const MAX_KDF_ITERATIONS: i32 = 1_000_000;
+
+// Cap on scrypt effective memory cost (128 * N * r). 1 GiB.
+const MAX_SCRYPT_MEMORY_BYTES: u64 = 1 << 30;
+
+// Cap on scrypt parallelism p.
+const MAX_SCRYPT_PARALLELISM: u16 = 16;
+
+fn scrypt_within_limits(params: &pkcs5::pbes2::ScryptParams) -> bool {
+    if params.parallelization > MAX_SCRYPT_PARALLELISM {
+        return false;
+    }
+    match 128u64
+        .checked_mul(params.cost_parameter)
+        .and_then(|value| value.checked_mul(u64::from(params.block_size)))
+    {
+        Some(memory) => memory <= MAX_SCRYPT_MEMORY_BYTES,
+        None => false,
+    }
+}
+
 pub fn verify_mac(mac_data: &MacData, password: &str, data: &[u8]) -> Result<()> {
+    if mac_data.iterations > MAX_MAC_ITERATIONS {
+        return Err(Error::InvalidParameters);
+    }
+
     match mac_data.mac.algorithm.oid {
         oid::SHA1_OID => {
             let key = kdf::derive_key_utf8::<Sha1>(
@@ -126,6 +154,16 @@ fn decrypt(alg: &AlgorithmIdentifierOwned, data: &[u8], password: &str) -> Resul
 
             let params = pbes2::Parameters::from_der(&params)?;
 
+            match &params.kdf {
+                pbes2::Kdf::Pbkdf2(pbkdf2) if pbkdf2.iteration_count > MAX_KDF_ITERATIONS as u32 => {
+                    return Err(Error::InvalidParameters);
+                }
+                pbes2::Kdf::Scrypt(scrypt) if !scrypt_within_limits(scrypt) => {
+                    return Err(Error::InvalidParameters);
+                }
+                _ => {}
+            }
+
             Ok(params
                 .decrypt(password.as_bytes(), data)
                 .map_err(|e| Error::Pkcs5Error(format!("{e}")))?)
@@ -140,6 +178,10 @@ fn decrypt(alg: &AlgorithmIdentifierOwned, data: &[u8], password: &str) -> Resul
                 let iterations: i32 = reader.decode()?;
                 Ok::<_, Error>((salt, iterations))
             })?;
+
+            if iterations > MAX_KDF_ITERATIONS {
+                return Err(Error::InvalidParameters);
+            }
 
             Pbes1::new(alg.oid, &salt, iterations, PbeMode::Decrypt).encrypt_decrypt(data, password)
         }
@@ -557,8 +599,9 @@ mod tests {
     use pkcs12::safe_bag::SafeBag;
 
     use crate::{
-        EncryptionAlgorithm,
-        codec::{SecretBag, secret_to_safe_bag},
+        EncryptionAlgorithm, MacAlgorithm,
+        codec::{SecretBag, compute_mac, secret_to_safe_bag, verify_mac},
+        error::Error,
         oid::BLOWFISH_KEY_OID,
         secret::{Secret, SecretKeyType::Aes},
     };
@@ -628,5 +671,122 @@ mod tests {
         let private_key_value = private_key_info.private_key.as_bytes();
         assert_eq!(secret.key(), private_key_value);
         assert_eq!(secret.key().len(), private_key_value.len());
+    }
+
+    #[test]
+    fn verify_mac_rejects_iterations_above_maximum_before_kdf() {
+        let data = b"authenticated safe";
+        let mut mac = compute_mac(data, MacAlgorithm::HmacSha256, 1, TEST_STORE_PASSWORD).unwrap();
+        mac.iterations = super::MAX_MAC_ITERATIONS + 1;
+
+        let result = verify_mac(&mac, TEST_STORE_PASSWORD, data);
+
+        assert!(matches!(result, Err(Error::InvalidParameters)));
+    }
+
+    #[test]
+    fn decrypt_rejects_pbes2_pbkdf2_iterations_above_maximum_before_kdf() {
+        let salt = [0x5au8; 32];
+        let iv = [0xa5u8; 16];
+        let mut params = pkcs5::pbes2::Parameters::generate_pbkdf2_sha256_aes256cbc(1000, &salt, iv).unwrap();
+        match &mut params.kdf {
+            pkcs5::pbes2::Kdf::Pbkdf2(pbkdf2) => {
+                pbkdf2.iteration_count = super::MAX_KDF_ITERATIONS as u32 + 1;
+            }
+            _ => unreachable!("builder always produces PBKDF2"),
+        }
+        let alg_id = super::AlgorithmIdentifierOwned {
+            oid: crate::oid::PBES2_OID,
+            parameters: Some(Any::from_der(&params.to_der().unwrap()).unwrap()),
+        };
+
+        let result = super::decrypt(&alg_id, b"ciphertext", TEST_STORE_PASSWORD);
+
+        assert!(matches!(result, Err(Error::InvalidParameters)));
+    }
+
+    // Builds a PBES2/scrypt AlgorithmIdentifier, letting the caller tamper
+    // with the decoded scrypt parameters before re-encoding.
+    fn scrypt_alg_id(tamper: impl FnOnce(&mut pkcs5::pbes2::ScryptParams)) -> super::AlgorithmIdentifierOwned {
+        let salt = [0x5au8; 32];
+        let iv = [0xa5u8; 16];
+        let scrypt_params = pkcs5::scrypt::Params::new(4, 8, 1).unwrap();
+        let mut params = pkcs5::pbes2::Parameters::generate_scrypt_aes256cbc(scrypt_params, &salt, iv).unwrap();
+        match &mut params.kdf {
+            pkcs5::pbes2::Kdf::Scrypt(scrypt) => tamper(scrypt),
+            _ => unreachable!("builder always produces scrypt"),
+        }
+        super::AlgorithmIdentifierOwned {
+            oid: crate::oid::PBES2_OID,
+            parameters: Some(Any::from_der(&params.to_der().unwrap()).unwrap()),
+        }
+    }
+
+    #[test]
+    fn decrypt_rejects_pbes2_scrypt_memory_cost_from_large_n_before_kdf() {
+        // r = 8 (from the builder), so N alone pushes 128 * N * r past 1 GiB.
+        let alg_id = scrypt_alg_id(|scrypt| {
+            scrypt.cost_parameter = (super::MAX_SCRYPT_MEMORY_BYTES / (128 * 8)) + 1;
+        });
+
+        let result = super::decrypt(&alg_id, b"ciphertext", TEST_STORE_PASSWORD);
+
+        assert!(matches!(result, Err(Error::InvalidParameters)));
+    }
+
+    #[test]
+    fn decrypt_rejects_pbes2_scrypt_memory_cost_from_large_block_size_before_kdf() {
+        // N within any sane bound, but a huge r blows the 128 * N * r budget —
+        // the case a cost-parameter-only guard misses.
+        let alg_id = scrypt_alg_id(|scrypt| {
+            scrypt.cost_parameter = 1 << 14;
+            scrypt.block_size = u16::MAX;
+        });
+
+        let result = super::decrypt(&alg_id, b"ciphertext", TEST_STORE_PASSWORD);
+
+        assert!(matches!(result, Err(Error::InvalidParameters)));
+    }
+
+    #[test]
+    fn decrypt_rejects_pbes2_scrypt_excessive_parallelism_before_kdf() {
+        let alg_id = scrypt_alg_id(|scrypt| {
+            scrypt.parallelization = super::MAX_SCRYPT_PARALLELISM + 1;
+        });
+
+        let result = super::decrypt(&alg_id, b"ciphertext", TEST_STORE_PASSWORD);
+
+        assert!(matches!(result, Err(Error::InvalidParameters)));
+    }
+
+    #[cfg(feature = "pbes1")]
+    #[test]
+    fn decrypt_rejects_pbes1_iterations_above_maximum_before_kdf() {
+        use der::{SliceWriter, asn1::OctetStringRef};
+
+        let salt = [0x5au8; 20];
+        let iterations: i32 = super::MAX_KDF_ITERATIONS + 1;
+        let salt_ref = OctetStringRef::new(&salt).unwrap();
+        let mut buf = vec![0u8; 64];
+        let mut writer = SliceWriter::new(&mut buf);
+        writer
+            .sequence(
+                (salt_ref.encoded_len().unwrap() + iterations.encoded_len().unwrap()).unwrap(),
+                |writer| {
+                    salt_ref.encode(writer)?;
+                    iterations.encode(writer)?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let params = writer.finish().unwrap();
+        let alg_id = super::AlgorithmIdentifierOwned {
+            oid: crate::oid::PBE_WITH_SHA_AND3_KEY_TRIPLE_DES_CBC_OID,
+            parameters: Some(Any::from_der(params).unwrap()),
+        };
+
+        let result = super::decrypt(&alg_id, b"ciphertext", TEST_STORE_PASSWORD);
+
+        assert!(matches!(result, Err(Error::InvalidParameters)));
     }
 }

@@ -131,6 +131,10 @@ impl KeyStore {
                     .iter()
                     .find(|c| c.cert.subject == entry.cert.issuer && !c.trusted)
                 {
+                    // prevent infinite loop in case of cycle certificate chains
+                    if certs.contains(&issuer.cert) {
+                        break;
+                    }
                     // Avoid duplication of self-signed certs.
                     if issuer.cert.subject != leaf_cert.subject {
                         certs.push(issuer.cert.clone());
