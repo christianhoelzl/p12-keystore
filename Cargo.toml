@@ -33,4 +33,4 @@ hmac = "0.13"
 rand = "0.10"
 
 [dev-dependencies]
-base64 = "0.22"
+base64 = "0.23"
