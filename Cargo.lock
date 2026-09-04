@@ -455,6 +455,7 @@ dependencies = [
  "des",
  "hex",
  "hmac",
+ "pbkdf2",
  "pkcs12",
  "pkcs5",
  "pkcs8",
