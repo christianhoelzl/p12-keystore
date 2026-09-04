@@ -196,6 +196,7 @@ impl KeyStore {
             encryption_iterations: 10000,
             mac_algorithm: MacAlgorithm::HmacSha256,
             mac_iterations: 10000,
+            pbmac1: None,
         }
     }
 
@@ -287,6 +288,7 @@ pub struct Pkcs12Writer<'a, 'b> {
     encryption_iterations: u32,
     mac_algorithm: MacAlgorithm,
     mac_iterations: u32,
+    pbmac1: Option<MacAlgorithm>,
 }
 
 impl Pkcs12Writer<'_, '_> {
@@ -311,6 +313,16 @@ impl Pkcs12Writer<'_, '_> {
     /// Set the number of iterations for MAC key derivation. Default is 10,000.
     pub fn mac_iterations(mut self, iterations: u32) -> Self {
         self.mac_iterations = iterations;
+        self
+    }
+
+    /// Protect the file with an RFC 9579 PBMAC1 integrity scheme instead of the
+    /// traditional PKCS#12 MAC, using the given HMAC algorithm (and matching PBKDF2 PRF).
+    ///
+    /// [`MacAlgorithm::HmacSha512_224`] and [`MacAlgorithm::HmacSha512_256`] are not
+    /// supported for PBMAC1 because RFC 8018 defines no matching PBKDF2 PRF.
+    pub fn pbmac1(mut self, hmac: MacAlgorithm) -> Self {
+        self.pbmac1 = Some(hmac);
         self
     }
 
@@ -416,12 +428,20 @@ impl Pkcs12Writer<'_, '_> {
             content: Any::from_der(&safe_bags.to_der()?)?,
         };
 
-        let mac_data = codec::compute_mac(
-            auth_safe.content.value(),
-            self.mac_algorithm,
-            self.mac_iterations as i32,
-            self.password,
-        )?;
+        let mac_data = match self.pbmac1 {
+            Some(hmac) => crate::pbmac1::compute_pbmac1(
+                auth_safe.content.value(),
+                hmac,
+                self.mac_iterations as i32,
+                self.password,
+            )?,
+            None => codec::compute_mac(
+                auth_safe.content.value(),
+                self.mac_algorithm,
+                self.mac_iterations as i32,
+                self.password,
+            )?,
+        };
 
         let pfx = Pfx {
             version: Version::V3,
