@@ -30,6 +30,7 @@ sha2 = "0.11"
 x509-parser = "0.18"
 hex = "0.4"
 hmac = "0.13"
+pbkdf2 = "0.13"
 rand = "0.10"
 
 [dev-dependencies]

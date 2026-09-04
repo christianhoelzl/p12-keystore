@@ -20,7 +20,8 @@
 //! * [EncryptionAlgorithm::PbeWithShaAnd40BitRc4Cbc] - legacy encryption to support the existing stores
 //! * [EncryptionAlgorithm::PbeWithHmacSha256AndAes256] - the default encryption which should be used for new keystores
 //!
-//! Supported MAC algorithms: [MacAlgorithm::HmacSha1] through [MacAlgorithm::HmacSha512_256]
+//! Supported MAC algorithms: [MacAlgorithm::HmacSha1] through [MacAlgorithm::HmacSha512_256],
+//! plus RFC 9579 PBMAC1 import.
 //!
 
 mod cert;
@@ -31,6 +32,7 @@ mod keystore;
 mod oid;
 #[cfg(feature = "pbes1")]
 mod pbes1;
+mod pbmac1;
 pub mod secret;
 
 pub use rand;

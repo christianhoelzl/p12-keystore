@@ -116,6 +116,10 @@ macro_rules! compute_traditional_mac {
 }
 
 pub fn verify_mac(mac_data: &MacData, password: &str, data: &[u8]) -> Result<()> {
+    if mac_data.mac.algorithm.oid == oid::PBMAC1_OID {
+        return crate::pbmac1::verify_pbmac1(mac_data, password, data);
+    }
+
     if mac_data.iterations > MAX_MAC_ITERATIONS {
         return Err(Error::InvalidParameters);
     }
